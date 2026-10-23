@@ -1,3 +1,36 @@
+# stereoanywhere: faster inference fork
+
+> **You are on `cuda-kernels`.** Research fork of [bartn8/stereoanywhere](https://github.com/bartn8/stereoanywhere) (base `c4aa114`; `main` mirrors upstream). Custom CUDA kernels, so this branch does not export to ONNX / TensorRT; there is no `portable` branch for this repo.
+>
+> What needs the kernels: the fp16 fast path in the `*_fast.py` / `inference.py` files (cuDNN-frontend fp16-accumulate convolutions, CUTLASS fused-epilogue convs, cost-volume / correlation kernels). Upstream's own modules and weights are unchanged.
+>
+> Build: prebuilt cubins (sm_80/86/89/90/120) and one CUTLASS shared library sit in `prebuilt/` next to the code (each < 3 MB). If a prebuilt does not match your GPU or the source hash, the code compiles it with `nvcc` from `CUDA_HOME` (default `/usr/local/cuda`) into `~/.cache`; the CUTLASS library is only rebuilt from source with `CUTLASS_DIR` set (CUTLASS v4.7.1 headers). fp16-accumulate convs need `pip install nvidia-cudnn-frontend`.
+>
+
+> Extra dependency: [`fastbb`](https://github.com/fastforks/fastbb) (fast backbones), `pip install` it or put it on `PYTHONPATH`.
+>
+
+> StereoAnywhere uses its own kernels in `models/stereoanywhere/sa_kernels.cu` (multi-arch fatbin in `prebuilt/`).
+>
+
+> Licence, as upstream (CC BY-NC-SA 4.0 with University of Bologna terms, see LICENCE.md)
+
+
+Released weights, RTX 5060 Ti 16 GB, torch 2.14.1+cu130, 2026-10-23. KITTI = 000000_10 (1242x375), Midd-H = Middlebury trainingH Motorcycle (1482x994). Median of 10 runs after warm-up (the first-call column is the very first call of a fresh process). Peak memory = torch peak allocated / reserved over the whole run (both sizes). EPE = mean over 3 ETH3D + 3 Middlebury-H training pairs (short check, not a benchmark; a pair that ran out of memory in any row is left out of the EPE mean of all rows). flags = set from the driver only, no upstream source edit: `torch.inference_mode()`, `cudnn.benchmark=True`, TF32 allowed, plus the fastest combination that keeps EPE within noise (listed in brackets in the row). `torch.compile` is not part of the row.
+
+
+
+| version | KITTI ms | Midd-H ms | speed-up at H (vs flags / vs upstream) | peak MB (alloc / reserved) | startup / first call / new size | ETH3D EPE | Midd-H EPE |
+|---|---|---|---|---|---|---|---|
+| upstream (fp32) | 2241.7 | OOM (16 GB GPU) | 1.00x | 10105 / 12220 | 6.2 s / 2.87 s / not measured | 0.143 | not measured |
+| upstream + flags (cudnn.benchmark, TF32, inference_mode) | 1801.9 | OOM (16 GB GPU) | 1.00x / n/a | 10589 / 10732 | 6.4 s / 8.65 s / not measured | 0.143 | not measured |
+| **cuda-kernels** | 343.9 | 906.9 | n/a / n/a | 3326 / 4022 | 3.2 s / 1.05 s / 1.02 s | 0.143 | not measured |
+
+Max / mean abs disparity difference cuda-kernels vs upstream: 14.1 px / 0.0223 px (KITTI + 6 EPE pairs; the maximum is set by a few single pixels).
+
+
+---
+
 <h1 align="center" style="border-bottom: 0;"> Stereo Anywhere: Robust Zero-Shot Deep Stereo Matching Even Where Either Stereo or Mono Fail (CVPR 2025)</h1> 
 
 <h3 align="center"> <b> Friday, June 13 from 10:30 to 12:30 - Poster Session 1 and Exhibit Hall (ExHall D) </b> </h3>
