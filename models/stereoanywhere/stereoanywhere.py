@@ -133,6 +133,9 @@ class StereoAnywhere(nn.Module):
             raise NotImplementedError()
                 
         stereo_corr_volume = corr_block.corr(fmap2, fmap3).squeeze(3).unsqueeze(1)
+        _fast = getattr(self, "_fast_cfg", None) is not None
+        if _fast:
+            fmap2 = fmap3 = None  # memory: not used any more
         mono_corr_volume = 1.73 * corr_block.corr(mde2_normals_lowres, mde3_normals_lowres).squeeze(3).unsqueeze(1)
         
         left_volmasks_lowres = generate_masks(mde2_lowres, N=self.args.vol_n_masks)     #.unsqueeze(4) B N H/4 W/4 1
@@ -158,14 +161,20 @@ class StereoAnywhere(nn.Module):
         else:
             coarse_dispstereo2, coarse_dispstereo3 = None, None
 
-        masked_mono_corr_volume = mono_corr_volume * left_volmasks_lowres.unsqueeze(4) * right_volmasks_lowres.unsqueeze(3)
-        agg_mono_corr_volume = self.hourglass_mono(masked_mono_corr_volume, features_left=fmde2, features_right=fmde3) # B, C, H/4, W/4, W/4
-        for i in range(self.args.n_additional_hourglass):
-            agg_mono_corr_volume = self.hourglass_mono_stack[i](agg_mono_corr_volume, features_left=fmde2, features_right=fmde3) # B, C, H/4, W/4, W/4
-        agg_disp_mono_corr = self.classifier_mono(agg_mono_corr_volume)
-        agg_conf_mono_corr = self.classifier_monoconf(agg_mono_corr_volume.detach())
+        if getattr(self, "_fast_cfg", None) is not None:  # inference path (models/stereoanywhere/fast.py)
+            from .fast import mono_volume_fast
+            agg_disp_mono_corr, agg_conf_mono_corr = mono_volume_fast(self, mono_corr_volume, left_volmasks_lowres, right_volmasks_lowres, fmde2, fmde3)
+            if self.args.use_aggregate_mono_vol:
+                mono_corr_volume = None  # not used any more (memory)
+        else:
+            masked_mono_corr_volume = mono_corr_volume * left_volmasks_lowres.unsqueeze(4) * right_volmasks_lowres.unsqueeze(3)
+            agg_mono_corr_volume = self.hourglass_mono(masked_mono_corr_volume, features_left=fmde2, features_right=fmde3) # B, C, H/4, W/4, W/4
+            for i in range(self.args.n_additional_hourglass):
+                agg_mono_corr_volume = self.hourglass_mono_stack[i](agg_mono_corr_volume, features_left=fmde2, features_right=fmde3) # B, C, H/4, W/4, W/4
+            agg_disp_mono_corr = self.classifier_mono(agg_mono_corr_volume)
+            agg_conf_mono_corr = self.classifier_monoconf(agg_mono_corr_volume.detach())
 
-        del masked_mono_corr_volume, agg_mono_corr_volume
+            del masked_mono_corr_volume, agg_mono_corr_volume
 
         if self.args.vol_downsample > 0:         
             agg_disp_mono_corr = F.interpolate(agg_disp_mono_corr, (_original_shape[2], _original_shape[3], _original_shape[4]), mode="trilinear", align_corners=True)
@@ -200,7 +209,13 @@ class StereoAnywhere(nn.Module):
 
         if self.args.use_truncate_vol:
             mde2_mirrorconf_lowres = handcrafted_mirror_detector(coarse_dispmono2_lowres, coarse_scaled_mde2_lowres, coarse_dispmonoconf2_lowres, softlrc_coarse_scaled_mde2_lowres, conf_th=self.args.mirror_conf_th)
-            left_truncate_mask = truncate_corr_volume_v2(coarse_scaled_mde2_lowres, mde2_mirrorconf_lowres, conf_th=None, attenuation_gain=self.args.mirror_attenuation).detach()
+            if _fast and "vk" in self._fast_cfg and B == 1 and not self.args.use_aggregate_stereo_vol:
+                # fused: mask computed on the fly and applied to the stereo volume in place (no W x W mask volume)
+                from .fast import truncate_inplace
+                truncate_inplace(stereo_corr_volume, coarse_scaled_mde2_lowres, mde2_mirrorconf_lowres, self.args.mirror_attenuation)
+                left_truncate_mask = 1
+            else:
+                left_truncate_mask = truncate_corr_volume_v2(coarse_scaled_mde2_lowres, mde2_mirrorconf_lowres, conf_th=None, attenuation_gain=self.args.mirror_attenuation).detach()
         else:
             left_truncate_mask = 1
 
@@ -251,12 +266,15 @@ class StereoAnywhere(nn.Module):
             _mono_corr_volume = (_mono_corr_volume * (1 - _left_mask) + _mono_corr_volume * left_noise_curve * _left_mask).detach()
 
         stereo_corr_fn = corr_block(
-            (left_truncate_mask*_stereo_corr_volume).squeeze(1).unsqueeze(3), radius=self.args.corr_radius, num_levels=self.args.corr_levels
+            (_stereo_corr_volume if (_fast and isinstance(left_truncate_mask, int) and left_truncate_mask == 1) else left_truncate_mask*_stereo_corr_volume).squeeze(1).unsqueeze(3), radius=self.args.corr_radius, num_levels=self.args.corr_levels
         )
 
         mono_corr_fn = corr_block(
             (_mono_corr_volume).squeeze(1).unsqueeze(3), radius=self.args.corr_radius, num_levels=self.args.corr_levels
         )
+        if _fast:  # memory: the corr pyramids hold what the iterations need
+            stereo_corr_volume = _stereo_corr_volume = left_truncate_mask = None
+            agg_disp_mono_corr = _mono_corr_volume = None
 
         if not self.args.init_disparity_zero:
             coords1[:,:1] = coords0[:,:1] - coarse_scaled_mde2_lowres
@@ -271,7 +289,8 @@ class StereoAnywhere(nn.Module):
             mono_corr = mono_corr_fn(coords1) # index correlation volume
             flow = coords1 - coords0
             
-            net_list, mask_up, delta_flow = self.update_block(net_list, inp_list, stereo_corr, mono_corr, flow, iter32=self.args.n_gru_layers==3, iter16=self.args.n_gru_layers>=2)
+            net_list, mask_up, delta_flow = self.update_block(net_list, inp_list, stereo_corr, mono_corr, flow, iter32=self.args.n_gru_layers==3, iter16=self.args.n_gru_layers>=2,
+                                                               upsample=not test_mode or itr == iters - 1)
 
             # in stereo mode, project flow onto epipolar
             delta_flow[:,1] = 0.0            

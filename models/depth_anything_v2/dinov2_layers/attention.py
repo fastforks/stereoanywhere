@@ -50,13 +50,9 @@ class Attention(nn.Module):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
 
-        q, k, v = qkv[0] * self.scale, qkv[1], qkv[2]
-        attn = q @ k.transpose(-2, -1)
-
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        # fused SDPA (flash / mem-efficient kernel) instead of materializing the N x N attention matrix; same math
+        x = nn.functional.scaled_dot_product_attention(q, k, v, scale=self.scale).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
